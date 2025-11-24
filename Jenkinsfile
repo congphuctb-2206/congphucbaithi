@@ -2,94 +2,79 @@ pipeline {
     agent any
 
     stages {
-        // CÀI JQ TỰ ĐỘNG NẾU CHƯA CÓ (chạy 1 lần là xong mãi mãi)
-        stage('Cài jq nếu chưa có') {
-            steps {
-                sh '''
-                    if ! command -v jq >/dev/null 2>&1; then
-                        echo "Đang cài jq..."
-                        if command -v apt-get >/dev/null; then
-                            sudo apt-get update && sudo apt-get install -y jq
-                        elif command -v yum >/dev/null; then
-                            sudo yum install -y jq
-                        elif command -v amazon-linux-extras >/dev/null; then
-                            sudo amazon-linux-extras install epel -y && sudo yum install -y jq
-                        fi
-                    else
-                        echo "jq đã có sẵn!"
-                    fi
-                '''
-            }
-        }
-
-        stage('Checkout Source Code') {
+        stage('Checkout') {
             steps {
                 checkout scm
-                echo "Đã lấy code mới nhất từ GitHub"
+                echo "Đã lấy code mới nhất"
             }
         }
 
-        stage('Build Docker Image & Push to ECR') {
+        stage('Build & Push ECR') {
             steps {
                 script {
-                    def buildTag   = "${env.BUILD_NUMBER}"
-                    def ecrRepo    = "cp-ecr"
-                    def region     = "ap-northeast-2"
-                    def accountId  = "591313757404"
+                    def tag = "${env.BUILD_NUMBER}"
+                    def repo = "cp-ecr"
+                    def account = "591313757404"
+                    def region = "ap-northeast-2"
 
-                    sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${accountId}.dkr.ecr.${region}.amazonaws.com"
-                    sh "docker build -t ${ecrRepo}:${buildTag} ."
-                    sh "docker tag ${ecrRepo}:${buildTag} ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
-                    sh "docker push ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
-                    env.IMAGE_URI = "${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
+                    sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${account}.dkr.ecr.${region}.amazonaws.com"
+                    sh "docker build -t ${repo}:${tag} ."
+                    sh "docker tag ${repo}:${tag} ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
+                    sh "docker push ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
+                    
+                    env.IMAGE_URI = "${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
                     echo "Push xong image: ${env.IMAGE_URI}"
                 }
             }
         }
 
-        // STAGE CHUẨN NHẤT – DÙNG jq ĐÃ CÀI Ở TRÊN → CHẠY 100%
-        stage('Update Task Definition & Deploy to ECS') {
+        stage('Deploy to ECS') {
             steps {
                 script {
-                    def taskFamily   = "taskcongphuc"   // sửa nếu tên khác
-                    def clusterName  = "cp-cluster"
-                    def serviceName  = "cp-sv"
-                    def region       = "ap-northeast-2"
+                    def family  = "taskcongphuc"     // tên family của bạn
+                    def cluster = "cp-cluster"
+                    def service = "cp-sv"
+                    def region  = "ap-northeast-2"
 
-                    sh "aws ecs describe-task-definition --task-definition ${taskFamily} --region ${region} --query 'taskDefinition' --output json > full.json"
-
+                    // Lấy task cũ + tạo task mới + thay image (1 lệnh jq duy nhất)
                     sh """
-                        jq '{
+                        aws ecs describe-task-definition --task-definition ${family} --region ${region} --query 'taskDefinition' > old.json
+
+                        cat old.json | jq '{
                             family: .family,
-                            executionRoleArn: .executionRoleArn,
-                            taskRoleArn: .taskRoleArn,
                             networkMode: .networkMode,
+                            taskRoleArn: .taskRoleArn,
+                            executionRoleArn: .executionRoleArn,
                             containerDefinitions: .containerDefinitions,
-                            volumes: .volumes,
-                            requiresCompatibilities: .requiresCompatibilities,
+                            volumes: (.volumes // []),
+                            placementConstraints: (.placementConstraints // []),
+                            requiresCompatibilities: (.requiresCompatibilities // ["FARGATE"]),
                             cpu: .cpu,
                             memory: .memory,
-                            placementConstraints: (.placementConstraints // empty),
-                            tags: (.tags // empty)
-                        }' full.json > clean.json
+                            tags: (.tags // []),
+                            runtimePlatform: .runtimePlatform
+                        } | .containerDefinitions[0].image = "${env.IMAGE_URI}"' > new-task.json
                     """
 
-                    sh """
-                        jq --arg img "${env.IMAGE_URI}" '.containerDefinitions[0].image = \$img' clean.json > final.json
-                    """
-
-                    def newTaskArn = sh(
-                        script: "aws ecs register-task-definition --cli-input-json file://final.json --region ${region} --query 'taskDefinition.taskDefinitionArn' --output text",
+                    // Register task mới
+                    def taskArn = sh(
+                        script: "aws ecs register-task-definition --cli-input-json file://new-task.json --region ${region} --query 'taskDefinition.taskDefinitionArn' --output text",
                         returnStdout: true
                     ).trim()
 
-                    echo "Task Definition mới: ${newTaskArn}"
+                    echo "Task Definition mới: ${taskArn}"
 
+                    // Update service
                     sh """
-                        aws ecs update-service --cluster ${clusterName} --service ${serviceName} --task-definition ${newTaskArn} --force-new-deployment --region ${region}
+                        aws ecs update-service \
+                            --cluster ${cluster} \
+                            --service ${service} \
+                            --task-definition ${taskArn} \
+                            --force-new-deployment \
+                            --region ${region}
                     """
 
-                    sh "rm -f full.json clean.json final.json"
+                    sh "rm -f old.json new-task.json"
                     echo "DEPLOY XONG 100%! Web sẽ mới trong 1-2 phút"
                 }
             }
@@ -97,7 +82,7 @@ pipeline {
     }
 
     post {
-        success { echo "CI/CD HOÀN HẢO – WEB ĐÃ MỚI!" }
-        failure { echo "Lỗi rồi, báo mình ngay nhé!" }
+        success { echo "CI/CD HOÀN HẢO – BẠN ĐÃ LÀM CHỦ ECS RỒI ĐẤY!" }
+        failure { echo "Lỗi gì thì nhắn anh liền nha!" }
     }
 }
