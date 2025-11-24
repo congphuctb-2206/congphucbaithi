@@ -25,7 +25,7 @@ const pool = mysql.createPool(dbConfig);
 
 // Endpoint kiểm tra sức khỏe (health check) cho ALB
 app.get('/', (req, res) => {
-  res.status(200).send('API is healthy!');
+  res.status(200).send('api đã sửa!');
 });
 
 // Endpoint lấy danh sách các dịch vụ
