@@ -53,7 +53,7 @@ pipeline {
                     sh "aws ecs describe-task-definition --task-definition ${taskFamily} --region ${region} --query 'taskDefinition' > current-task.json"
 
                     // 2. Thay thế image bằng tag mới nhất (dùng sed, không cần jq)
-                    sh "sed -i 's|\"image\": \".*\"|\"image\": \"${env.IMAGE_URI}\"|' current-task.json"
+                    sh "perl -pi -e 's|\"image\": \".*\"|\"image\": \"${env.IMAGE_URI}\"|g' current-task.json"
 
                     // 3. Register revision mới (revision tự tăng)
                     def newTaskArn = sh(
