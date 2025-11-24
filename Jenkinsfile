@@ -1,76 +1,73 @@
-// =====================================================================
-// KHAI BÁO CÁC BIẾN CẤU HÌNH (THAY THẾ CHỖ BỊ CHẶN)
-// =====================================================================
-def ecrRepository = "cp-ecr"       // Ví dụ: ecommerce-backend
-def ecsCluster = "cp-cluster"           // Tên Cluster ECS của bạn
-def ecsService = "cp-sv"           // Tên Service ECS của bạn
-def taskDefinitionName = "taskcongphuc"  // Tên Task Definition gốc (VD: backend-task)
-def containerName = "congphucontai" // Tên Container trong Task Definition (Lấy từ Task Def JSON)
-def awsRegion = "ap-northeast-2"                 // Region của bạn (VD: ap-southeast-1)
-def awsAccountId = "591313757404"                // ID tài khoản AWS của bạn (Đã có sẵn)
-
 pipeline {
     agent any
 
     stages {
-        stage('Checkout Code') {
+        // ──────────────────────────────────────────────────────────────
+        // 1. LẤY CODE MỚI NHẤT TỪ GITHUB (khi bạn push code lên)
+        // ──────────────────────────────────────────────────────────────
+        stage('Checkout Source Code') {
             steps {
-                echo '1. Lấy mã nguồn mới nhất...'
-                checkout scm 
+                checkout scm
+                echo "Đã lấy code mới nhất từ GitHub"
             }
         }
 
-        stage('Build and Push Image to ECR') {
+        // ──────────────────────────────────────────────────────────────
+        // 2. BUILD DOCKER IMAGE + ĐẨY LÊN ECR
+        //    → Tạo image mới có tag là số build (ví dụ: 25, 26, 27...)
+        //    → Đẩy lên kho ECR tên cp-ecr
+        // ──────────────────────────────────────────────────────────────
+        stage('Build Docker Image & Push to ECR') {
             steps {
-                echo '2. Đăng nhập ECR và Build Image...'
-                // Tạo Image Tag duy nhất dựa trên Build Number
                 script {
-                    env.IMAGE_TAG = "${env.BUILD_NUMBER}"
+                    def buildTag   = "${env.BUILD_NUMBER}"                  // tag = số lần build
+                    def ecrRepo    = "cp-ecr"                               // tên repo ECR của bạn
+                    def region     = "ap-northeast-2"                       // region bạn dùng
+                    def accountId  = "591313757404"                         // AWS account ID
+
+                    // Đăng nhập ECR
+                    sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${accountId}.dkr.ecr.${region}.amazonaws.com"
+
+                    // Build + tag + push image
+                    sh "docker build -t ${ecrRepo}:${buildTag} ."
+                    sh "docker tag ${ecrRepo}:${buildTag} ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
+                    sh "docker push ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
+
+                    echo "Đã đẩy image thành công: ${ecrRepo}:${buildTag}"
+                    env.IMAGE_URI = "${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
                 }
-                
-                // Đăng nhập ECR (Sử dụng IAM Role gắn với EC2 Jenkins)
-                sh "aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin ${awsAccountId}.dkr.ecr.${awsRegion}.amazonaws.com"
-
-                // Build Image Docker (Sử dụng Dockerfile trong Repo)
-                sh "docker build -t ${ecrRepository}:${env.IMAGE_TAG} ."
-
-                // Gắn Tag hoàn chỉnh (Fully Qualified ECR URI) và Push lên ECR
-                sh "docker tag ${ecrRepository}:${env.IMAGE_TAG} ${awsAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/${ecrRepository}:${env.IMAGE_TAG}"
-                sh "docker push ${awsAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/${ecrRepository}:${env.IMAGE_TAG}"
             }
         }
 
+        // ──────────────────────────────────────────────────────────────
+        // 3. TRIỂN KHAI LÊN ECS
+        //    → Dùng lệnh force-new-deployment → ECS sẽ tự kéo image mới nhất
+        //    → Không cần register task definition, không cần jq → đơn giản nhất
+        // ──────────────────────────────────────────────────────────────
         stage('Deploy to ECS') {
             steps {
-                echo '3. Cập nhật Task Definition và ECS Service...'
-                
                 script {
-                    // 3a. Xác định URI Image mới
-                    def newImageUri = "${awsAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/${ecrRepository}:${env.IMAGE_TAG}"
+                    def clusterName = "cp-cluster"     // tên cluster bạn tạo
+                    def serviceName = "cp-sv"          // tên service bạn tạo
 
-                    // 3b. Lấy Task Definition hiện tại (LƯU Ý: Phải cài đặt JQ trên Jenkins EC2)
-                    def taskDefJson = sh(
-                        script: "aws ecs describe-task-definition --task-definition ${taskDefinitionName} --region ${awsRegion} --query 'taskDefinition'",
-                        returnStdout: true
-                    )
-                    
-                    // 3c. Dùng JQ để sửa URI Image và dọn dẹp các trường không cần thiết
-                    // [0] đại diện cho container đầu tiên trong Task Definition
-                    def newTaskDefJson = sh(
-                        script: "echo \"${taskDefJson}\" | jq 'del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | .containerDefinitions[0].image=\"${newImageUri}\"' > updated-task-def.json",
-                        returnStdout: true
-                    )
-                    
-                    // 3d. Đăng ký Task Definition mới với URI Image cập nhật
-                    sh "aws ecs register-task-definition --cli-input-json file://updated-task-def.json --region ${awsRegion}"
+                    sh """
+                        aws ecs update-service \
+                            --cluster ${clusterName} \
+                            --service ${serviceName} \
+                            --force-new-deployment \
+                            --region ap-northeast-2
+                    """
 
-                    // 3e. Cập nhật ECS Service để sử dụng Task Definition mới nhất
-                    sh "aws ecs update-service --cluster ${ecsCluster} --service ${ecsService} --force-new-deployment --region ${awsRegion}"
+                    echo "Đã kích hoạt triển khai mới trên ECS"
+                    echo "Chờ 1-2 phút là web tự động cập nhật phiên bản mới"
                 }
-                echo 'Triển khai lên ECS đã hoàn tất.'
             }
         }
     }
+
+    // Thông báo kết quả cuối cùng
+    post {
+        success { echo "CI/CD HOÀN TẤT " }
+        failure { echo "Có lỗi xảy ra, xem log để sửa" }
+    }
 }
-
-
