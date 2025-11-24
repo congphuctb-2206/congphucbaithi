@@ -3,7 +3,7 @@ pipeline {
 
     stages {
         // ──────────────────────────────────────────────────────────────
-        // 1. LẤY CODE MỚI NHẤT TỪ GITHUB (khi bạn push code lên)
+        // 1. LẤY CODE MỚI NHẤT TỪ GITHUB
         // ──────────────────────────────────────────────────────────────
         stage('Checkout Source Code') {
             steps {
@@ -14,21 +14,19 @@ pipeline {
 
         // ──────────────────────────────────────────────────────────────
         // 2. BUILD DOCKER IMAGE + ĐẨY LÊN ECR
-        //    → Tạo image mới có tag là số build (ví dụ: 25, 26, 27...)
-        //    → Đẩy lên kho ECR tên cp-ecr
         // ──────────────────────────────────────────────────────────────
         stage('Build Docker Image & Push to ECR') {
             steps {
                 script {
-                    def buildTag   = "${env.BUILD_NUMBER}"                  // tag = số lần build
-                    def ecrRepo    = "cp-ecr"                               // tên repo ECR của bạn
-                    def region     = "ap-northeast-2"                       // region bạn dùng
-                    def accountId  = "591313757404"                         // AWS account ID
+                    def buildTag   = "${env.BUILD_NUMBER}"
+                    def ecrRepo    = "cp-ecr"
+                    def region     = "ap-northeast-2"
+                    def accountId  = "591313757404"
 
                     // Đăng nhập ECR
                     sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${accountId}.dkr.ecr.${region}.amazonaws.com"
 
-                    // Build + tag + push image
+                    // Build + tag + push
                     sh "docker build -t ${ecrRepo}:${buildTag} ."
                     sh "docker tag ${ecrRepo}:${buildTag} ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
                     sh "docker push ${accountId}.dkr.ecr.${region}.amazonaws.com/${ecrRepo}:${buildTag}"
@@ -40,34 +38,64 @@ pipeline {
         }
 
         // ──────────────────────────────────────────────────────────────
-        // 3. TRIỂN KHAI LÊN ECS
-        //    → Dùng lệnh force-new-deployment → ECS sẽ tự kéo image mới nhất
-        //    → Không cần register task definition, không cần jq → đơn giản nhất
+        // 3. TỰ ĐỘNG TẠO TASK DEFINITION MỚI + DEPLOY (QUAN TRỌNG NHẤT)
+        // → Fix triệt để vấn đề digest cũ, đảm bảo luôn pull image mới
         // ──────────────────────────────────────────────────────────────
-        stage('Deploy to ECS') {
+        stage('Update Task Definition & Deploy to ECS') {
             steps {
                 script {
-                    def clusterName = "cp-cluster"     // tên cluster bạn tạo
-                    def serviceName = "cp-sv"          // tên service bạn tạo
+                    def taskFamily   = "taskcongphuc"      // TÊN FAMILY CỦA BẠN (xem trong ECS → Task Definitions)
+                    def clusterName  = "cp-cluster"
+                    def serviceName  = "cp-sv"
+                    def region       = "ap-northeast-2"
 
+                    // 1. Lấy task definition hiện tại làm template
+                    sh "aws ecs describe-task-definition --task-definition ${taskFamily} --region ${region} --query 'taskDefinition' > current-task.json"
+
+                    // 2. Thay thế image bằng tag mới nhất (dùng sed, không cần jq)
+                    sh "sed -i 's|\"image\": \".*\"|\"image\": \"${env.IMAGE_URI}\"|' current-task.json"
+
+                    // 3. Register revision mới (revision tự tăng)
+                    def newTaskArn = sh(
+                        script: """
+                            aws ecs register-task-definition \
+                                --cli-input-json file://current-task.json \
+                                --family ${taskFamily} \
+                                --region ${region} \
+                                --query 'taskDefinition.taskDefinitionArn' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Đã tạo Task Definition mới: ${newTaskArn}"
+
+                    // 4. Update service để dùng task definition mới + force deploy
                     sh """
                         aws ecs update-service \
                             --cluster ${clusterName} \
                             --service ${serviceName} \
+                            --task-definition ${newTaskArn} \
                             --force-new-deployment \
-                            --region ap-northeast-2
+                            --region ${region}
                     """
 
-                    echo "Đã kích hoạt triển khai mới trên ECS"
-                    echo "Chờ 1-2 phút là web tự động cập nhật phiên bản mới"
+                    // Dọn dẹp file tạm
+                    sh "rm -f current-task.json"
+
+                    echo "HOÀN TẤT DEPLOY! Image đang chạy: ${env.IMAGE_URI}"
+                    echo "Web sẽ cập nhật trong vòng 1-2 phút"
                 }
             }
         }
     }
 
-    // Thông báo kết quả cuối cùng
     post {
-        success { echo "CI/CD HOÀN TẤT ĐÃ THÊM WEBHOOK để CI " }
-        failure { echo "Có lỗi xảy ra, xem log để sửa" }
+        success {
+            echo "CI/CD THÀNH CÔNG 100%! Web đã được cập nhật phiên bản mới nhất"
+        }
+        failure {
+            echo "CÓ LỖI XẢY RA – Xem log để sửa nhé!"
+        }
     }
 }
