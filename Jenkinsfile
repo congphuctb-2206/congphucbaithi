@@ -2,6 +2,7 @@ pipeline {
     agent any
 
     stages {
+
         stage('Checkout') {
             steps {
                 checkout scm
@@ -17,11 +18,15 @@ pipeline {
                     def account = "591313757404"
                     def region = "ap-northeast-2"
 
-                    sh "aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${account}.dkr.ecr.${region}.amazonaws.com"
-                    sh "docker build -t ${repo}:${tag} ."
-                    sh "docker tag ${repo}:${tag} ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
-                    sh "docker push ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
-                    
+                    sh """
+                        aws ecr get-login-password --region ${region} \
+                        | docker login --username AWS --password-stdin ${account}.dkr.ecr.${region}.amazonaws.com
+
+                        docker build -t ${repo}:${tag} .
+                        docker tag ${repo}:${tag} ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}
+                        docker push ${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}
+                    """
+
                     env.IMAGE_URI = "${account}.dkr.ecr.${region}.amazonaws.com/${repo}:${tag}"
                     echo "Push xong image: ${env.IMAGE_URI}"
                 }
@@ -31,15 +36,21 @@ pipeline {
         stage('Deploy to ECS') {
             steps {
                 script {
-                    def family  = "taskcongphuc"     // tên family của bạn
+                    def family  = "taskcongphuc"
                     def cluster = "cp-cluster"
                     def service = "cp-sv"
                     def region  = "ap-northeast-2"
 
-                    // Lấy task cũ + tạo task mới + thay image (1 lệnh jq duy nhất)
+                    // Xuất task definition cũ
                     sh """
-                        aws ecs describe-task-definition --task-definition ${family} --region ${region} --query 'taskDefinition' > old.json
+                        aws ecs describe-task-definition \
+                            --task-definition ${family} \
+                            --region ${region} \
+                            --query 'taskDefinition' > old.json
+                    """
 
+                    // Tạo task definition mới (LOẠI BỎ TAGS ĐỂ KHÔNG LỖI)
+                    sh """
                         cat old.json | jq '{
                             family: .family,
                             networkMode: .networkMode,
@@ -51,20 +62,25 @@ pipeline {
                             requiresCompatibilities: (.requiresCompatibilities // ["FARGATE"]),
                             cpu: .cpu,
                             memory: .memory,
-                            tags: (.tags // []),
                             runtimePlatform: .runtimePlatform
                         } | .containerDefinitions[0].image = "${env.IMAGE_URI}"' > new-task.json
                     """
 
-                    // Register task mới
+                    // Đăng ký task mới
                     def taskArn = sh(
-                        script: "aws ecs register-task-definition --cli-input-json file://new-task.json --region ${region} --query 'taskDefinition.taskDefinitionArn' --output text",
+                        script: """
+                            aws ecs register-task-definition \
+                                --cli-input-json file://new-task.json \
+                                --region ${region} \
+                                --query 'taskDefinition.taskDefinitionArn' \
+                                --output text
+                        """,
                         returnStdout: true
                     ).trim()
 
                     echo "Task Definition mới: ${taskArn}"
 
-                    // Update service
+                    // Update ECS service
                     sh """
                         aws ecs update-service \
                             --cluster ${cluster} \
@@ -75,14 +91,14 @@ pipeline {
                     """
 
                     sh "rm -f old.json new-task.json"
-                    echo "DEPLOY XONG 100%! Web sẽ mới trong 1-2 phút"
+                    echo "DEPLOY XONG 100% – ECS đang chạy phiên bản mới!"
                 }
             }
         }
     }
 
     post {
-        success { echo "CI/CD HOÀN HẢO – BẠN ĐÃ LÀM CHỦ ECS RỒI ĐẤY!" }
-        failure { echo "Lỗi gì thì nhắn anh liền nha!" }
+        success { echo "CI/CD HOÀN HẢO – Triển khai ECS thành công!" }
+        failure { echo "Có lỗi rồi bạn ơi, gọi mình hỗ trợ ngay nhé!" }
     }
 }
