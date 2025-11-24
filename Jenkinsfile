@@ -67,7 +67,7 @@ pipeline {
 
     // Thông báo kết quả cuối cùng
     post {
-        success { echo "CI/CD HOÀN TẤT " }
+        success { echo "CI/CD HOÀN TẤT ĐÃ THÊM WEBHOOK để CI " }
         failure { echo "Có lỗi xảy ra, xem log để sửa" }
     }
 }
